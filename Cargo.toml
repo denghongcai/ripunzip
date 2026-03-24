@@ -37,7 +37,7 @@ thiserror = "2.0.12"
 wildmatch = "2.1.1"
 zip = "3.0"
 filetime = "0.2"
-time = "0.3"
+time = { version = "0.3", features = ["local-offset"] }
 
 [dev-dependencies]
 hexdump = "0.1.1"
