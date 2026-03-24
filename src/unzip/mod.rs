@@ -591,11 +591,26 @@ fn extract_file_inner<R: Read>(
     Ok(())
 }
 
+/// Returns the local UTC offset in seconds, computed once and cached.
+fn local_utc_offset_secs() -> i64 {
+    use std::sync::OnceLock;
+    static OFFSET: OnceLock<i64> = OnceLock::new();
+    *OFFSET.get_or_init(|| {
+        time::UtcOffset::current_local_offset()
+            .map(|o| o.whole_seconds() as i64)
+            .unwrap_or(0)
+    })
+}
+
 /// Extracts the modification time from a zip file entry as a `FileTime`.
+/// ZIP stores local time without timezone info, so we adjust by the local offset.
 fn zip_file_mtime<R: Read>(file: &ZipFile<R>) -> Option<filetime::FileTime> {
     file.last_modified()
         .and_then(|dt| time::OffsetDateTime::try_from(dt).ok())
-        .map(|odt| filetime::FileTime::from_unix_time(odt.unix_timestamp(), odt.nanosecond()))
+        .map(|odt| {
+            let adjusted_ts = odt.unix_timestamp() - local_utc_offset_secs();
+            filetime::FileTime::from_unix_time(adjusted_ts, odt.nanosecond())
+        })
 }
 
 /// An engine used to ensure we don't conflict in creating directories
@@ -970,7 +985,7 @@ mod tests {
 
         let expected_odt = time::OffsetDateTime::try_from(dt).unwrap();
         let expected_mtime = filetime::FileTime::from_unix_time(
-            expected_odt.unix_timestamp(),
+            expected_odt.unix_timestamp() - super::local_utc_offset_secs(),
             expected_odt.nanosecond(),
         );
 
