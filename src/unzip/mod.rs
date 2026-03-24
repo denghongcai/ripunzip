@@ -90,6 +90,7 @@ pub struct UnzipEngine {
     _temp_file: Option<tempfile::NamedTempFile>,
     compressed_length: u64,
     directory_creator: DirectoryCreator,
+    deferred_dir_times: DeferredDirTimes,
 }
 
 /// Code which can determine whether to unzip a given filename.
@@ -105,6 +106,7 @@ trait UnzipEngineImpl {
         &mut self,
         options: UnzipOptions,
         directory_creator: &DirectoryCreator,
+        deferred_dir_times: &DeferredDirTimes,
     ) -> Vec<RipunzipErrors>;
 
     // Due to lack of RPITIT we'll return a Vec<String> here
@@ -120,11 +122,13 @@ impl UnzipEngineImpl for UnzipFileEngine {
         &mut self,
         options: UnzipOptions,
         directory_creator: &DirectoryCreator,
+        deferred_dir_times: &DeferredDirTimes,
     ) -> Vec<RipunzipErrors> {
         unzip_serial_or_parallel(
             self.0.len(),
             options,
             directory_creator,
+            deferred_dir_times,
             || self.0.clone(),
             || {},
         )
@@ -149,6 +153,7 @@ impl<F: Fn()> UnzipEngineImpl for UnzipUriEngine<F> {
         &mut self,
         options: UnzipOptions,
         directory_creator: &DirectoryCreator,
+        deferred_dir_times: &DeferredDirTimes,
     ) -> Vec<RipunzipErrors> {
         self.0
             .set_expected_access_pattern(AccessPattern::SequentialIsh);
@@ -156,6 +161,7 @@ impl<F: Fn()> UnzipEngineImpl for UnzipUriEngine<F> {
             self.1.len(),
             options,
             directory_creator,
+            deferred_dir_times,
             || self.1.clone(),
             || self.0.read_skip_expected(),
         );
@@ -185,6 +191,7 @@ impl UnzipEngine {
             _temp_file: None,
             compressed_length,
             directory_creator: DirectoryCreator::default(),
+            deferred_dir_times: DeferredDirTimes::default(),
         })
     }
 
@@ -240,6 +247,7 @@ impl UnzipEngine {
             _temp_file: temp_file,
             compressed_length,
             directory_creator: DirectoryCreator::default(),
+            deferred_dir_times: DeferredDirTimes::default(),
         })
     }
 
@@ -255,7 +263,10 @@ impl UnzipEngine {
         options
             .progress_reporter
             .total_bytes_expected(self.compressed_length);
-        let errors = self.zipfile.unzip(options, &self.directory_creator);
+        let mut errors = self
+            .zipfile
+            .unzip(options, &self.directory_creator, &self.deferred_dir_times);
+        errors.extend(self.deferred_dir_times.apply_all());
         // Return the first error code, if any.
         errors.into_iter().next().map(Result::Err).unwrap_or(Ok(()))
     }
@@ -285,6 +296,7 @@ fn unzip_serial_or_parallel<'a, T: Read + Seek + 'a>(
     len: usize,
     options: UnzipOptions,
     directory_creator: &DirectoryCreator,
+    deferred_dir_times: &DeferredDirTimes,
     get_ziparchive_clone: impl Fn() -> ZipArchive<T> + Sync,
     // Call when a file is going to be skipped
     file_skip_callback: impl Fn() + Sync + Send + Clone,
@@ -300,6 +312,7 @@ fn unzip_serial_or_parallel<'a, T: Read + Seek + 'a>(
                     &options.password,
                     progress_reporter,
                     directory_creator,
+                    deferred_dir_times,
                 )
             })
             .filter_map(Result::err)
@@ -322,6 +335,7 @@ fn unzip_serial_or_parallel<'a, T: Read + Seek + 'a>(
                         &options.password,
                         progress_reporter,
                         directory_creator,
+                        deferred_dir_times,
                     )
                 })
                 .filter_map(Result::err)
@@ -371,6 +385,7 @@ fn unzip_serial_or_parallel<'a, T: Read + Seek + 'a>(
                         &options.output_directory,
                         progress_reporter,
                         directory_creator,
+                        deferred_dir_times,
                     );
                     file_skip_callback();
                     r
@@ -388,13 +403,20 @@ fn extract_file_by_index<'a, T: Read + Seek + 'a>(
     password: &Option<String>,
     progress_reporter: &dyn UnzipProgressReporter,
     directory_creator: &DirectoryCreator,
+    deferred_dir_times: &DeferredDirTimes,
 ) -> Result<(), RipunzipErrors> {
     let myzip: &mut zip::ZipArchive<T> = &mut get_ziparchive_clone();
     let file: ZipFile<T> = match password {
         None => myzip.by_index(i)?,
         Some(string) => myzip.by_index_decrypt(i, string.as_bytes())?,
     };
-    extract_file(file, output_directory, progress_reporter, directory_creator)
+    extract_file(
+        file,
+        output_directory,
+        progress_reporter,
+        directory_creator,
+        deferred_dir_times,
+    )
 }
 
 fn extract_file<R: Read>(
@@ -402,6 +424,7 @@ fn extract_file<R: Read>(
     output_directory: &Option<PathBuf>,
     progress_reporter: &dyn UnzipProgressReporter,
     directory_creator: &DirectoryCreator,
+    deferred_dir_times: &DeferredDirTimes,
 ) -> Result<(), RipunzipErrors> {
     let name = file
         .enclosed_name()
@@ -409,8 +432,13 @@ fn extract_file<R: Read>(
         .map(Path::to_string_lossy)
         .unwrap_or_else(|| Cow::Borrowed("<unprintable>"))
         .to_string();
-    if let Err(e) = extract_file_inner(file, output_directory, progress_reporter, directory_creator)
-    {
+    if let Err(e) = extract_file_inner(
+        file,
+        output_directory,
+        progress_reporter,
+        directory_creator,
+        deferred_dir_times,
+    ) {
         eprintln!("Failed to extract {name}");
         return Err(e);
     }
@@ -424,6 +452,7 @@ fn extract_file_inner<R: Read>(
     output_directory: &Option<PathBuf>,
     progress_reporter: &dyn UnzipProgressReporter,
     directory_creator: &DirectoryCreator,
+    deferred_dir_times: &DeferredDirTimes,
 ) -> Result<(), RipunzipErrors> {
     let name = file
         .enclosed_name()
@@ -440,8 +469,12 @@ fn extract_file_inner<R: Read>(
         file.compressed_size(),
         display_name
     );
+    let mtime = zip_file_mtime(&file);
     if file.name().ends_with('/') {
         directory_creator.create_dir_all(&out_path)?;
+        if let Some(mtime) = mtime {
+            deferred_dir_times.record(out_path.clone(), mtime);
+        }
     } else {
         if let Some(parent) = out_path.parent() {
             directory_creator.create_dir_all(parent)?;
@@ -474,6 +507,9 @@ fn extract_file_inner<R: Read>(
                         ),
                         source: e,
                     });
+                }
+                if let Some(mtime) = mtime {
+                    let _ = filetime::set_symlink_file_times(&out_path, mtime, mtime);
                 }
             }
         } else {
@@ -510,6 +546,18 @@ fn extract_file_inner<R: Read>(
                 });
             }
             progress_updater.finish();
+            // Set mtime before permissions (in case permissions make file read-only)
+            if let Some(mtime) = mtime {
+                if let Err(e) = filetime::set_file_mtime(&out_path, mtime) {
+                    return Err(RipunzipErrors::IOErrorWithContext {
+                        context: format!(
+                            "Failed to set modification time for {}",
+                            out_path.display()
+                        ),
+                        source: e,
+                    });
+                }
+            }
         }
     }
 
@@ -543,6 +591,13 @@ fn extract_file_inner<R: Read>(
     Ok(())
 }
 
+/// Extracts the modification time from a zip file entry as a `FileTime`.
+fn zip_file_mtime<R: Read>(file: &ZipFile<R>) -> Option<filetime::FileTime> {
+    file.last_modified()
+        .and_then(|dt| time::OffsetDateTime::try_from(dt).ok())
+        .map(|odt| filetime::FileTime::from_unix_time(odt.unix_timestamp(), odt.nanosecond()))
+}
+
 /// An engine used to ensure we don't conflict in creating directories
 /// between threads
 #[derive(Default)]
@@ -567,6 +622,42 @@ impl DirectoryCreator {
         }
 
         Ok(())
+    }
+}
+
+/// Collects directory modification times for deferred application.
+/// Directory mtimes must be set after all files are extracted, because
+/// extracting files into a directory changes its mtime.
+#[derive(Default)]
+struct DeferredDirTimes(Mutex<Vec<(PathBuf, filetime::FileTime)>>);
+
+impl DeferredDirTimes {
+    fn record(&self, path: PathBuf, mtime: filetime::FileTime) {
+        self.0.lock().unwrap().push((path, mtime));
+    }
+
+    /// Apply all deferred directory mtimes, deepest-first to avoid parent overwrite.
+    fn apply_all(&self) -> Vec<RipunzipErrors> {
+        let mut entries = self.0.lock().unwrap();
+        entries.sort_by(|a, b| {
+            b.0.components()
+                .count()
+                .cmp(&a.0.components().count())
+        });
+        entries
+            .drain(..)
+            .filter_map(|(path, mtime)| {
+                filetime::set_file_mtime(&path, mtime)
+                    .map_err(|e| RipunzipErrors::IOErrorWithContext {
+                        context: format!(
+                            "Failed to set modification time for directory {}",
+                            path.display()
+                        ),
+                        source: e,
+                    })
+                    .err()
+            })
+            .collect()
     }
 }
 
@@ -675,7 +766,6 @@ mod tests {
             .unwrap();
         zip.finish().unwrap();
 
-        let zf = File::open(zf).unwrap();
         let outdir = td.path().join("outdir");
         let options = UnzipOptions {
             output_directory: Some(outdir.clone()),
@@ -847,5 +937,55 @@ mod tests {
             ZipParams::new(FileSizes::Variable, 3, zip::CompressionMethod::Deflated),
             ServerType::NoContentLength,
         )
+    }
+
+    #[test]
+    fn test_extract_preserves_mtime() {
+        let td = tempdir().unwrap();
+        let zf = td.path().join("z.zip");
+        let file = File::create(&zf).unwrap();
+        let mut zip = ZipWriter::new(file);
+        // 2023-06-15 12:30:00
+        let dt = zip::DateTime::from_date_and_time(2023, 6, 15, 12, 30, 0).unwrap();
+        let options: FileOptions<ExtendedFileOptions> = FileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored)
+            .unix_permissions(0o755)
+            .last_modified_time(dt);
+        zip.add_directory("testdir/", options.clone()).unwrap();
+        zip.start_file("testdir/a.txt", options.clone()).unwrap();
+        zip.write_all(b"Contents of A\n").unwrap();
+        zip.start_file("b.txt", options).unwrap();
+        zip.write_all(b"Contents of B\n").unwrap();
+        zip.finish().unwrap();
+
+        let outdir = td.path().join("outdir");
+        let options = UnzipOptions {
+            output_directory: Some(outdir.clone()),
+            password: None,
+            single_threaded: false,
+            filename_filter: None,
+            progress_reporter: Box::new(NullProgressReporter),
+        };
+        UnzipEngine::for_file(zf).unwrap().unzip(options).unwrap();
+
+        let expected_odt = time::OffsetDateTime::try_from(dt).unwrap();
+        let expected_mtime = filetime::FileTime::from_unix_time(
+            expected_odt.unix_timestamp(),
+            expected_odt.nanosecond(),
+        );
+
+        // Check file mtime
+        let metadata = std::fs::metadata(outdir.join("testdir/a.txt")).unwrap();
+        let actual_mtime = filetime::FileTime::from_last_modification_time(&metadata);
+        assert_eq!(actual_mtime, expected_mtime);
+
+        let metadata = std::fs::metadata(outdir.join("b.txt")).unwrap();
+        let actual_mtime = filetime::FileTime::from_last_modification_time(&metadata);
+        assert_eq!(actual_mtime, expected_mtime);
+
+        // Check directory mtime
+        let metadata = std::fs::metadata(outdir.join("testdir")).unwrap();
+        let actual_mtime = filetime::FileTime::from_last_modification_time(&metadata);
+        assert_eq!(actual_mtime, expected_mtime);
     }
 }
